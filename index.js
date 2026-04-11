@@ -40,18 +40,31 @@ const scUrl = name => `https://soundcloud.com/${name}/tracks`;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Run yt-dlp with the given argument array (no shell, avoids injection). */
+const YTDLP_TIMEOUT_MS = 180_000; // 3 minutes per yt-dlp invocation
+
+function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
+
+/** Run yt-dlp with the given argument array (no shell, avoids injection). Kills after timeout. */
 function runYtDlp(args) {
   return new Promise((resolve, reject) => {
     const out  = [];
     const err  = [];
     const proc = spawn(YT_DLP, args);
+    let killed = false;
+
+    const timer = setTimeout(() => {
+      killed = true;
+      proc.kill('SIGKILL');
+      reject(new Error(`yt-dlp timed out after ${YTDLP_TIMEOUT_MS / 1000}s — args: ${args.join(' ')}`));
+    }, YTDLP_TIMEOUT_MS);
 
     proc.stdout.on('data', chunk => out.push(chunk));
     proc.stderr.on('data', chunk => err.push(chunk));
 
-    proc.on('error', e => reject(new Error(`Failed to start yt-dlp ("${YT_DLP}"): ${e.message}`)));
+    proc.on('error', e => { clearTimeout(timer); reject(new Error(`Failed to start yt-dlp ("${YT_DLP}"): ${e.message}`)); });
     proc.on('close', code => {
+      clearTimeout(timer);
+      if (killed) return; // already rejected
       if (code !== 0) {
         reject(new Error(`yt-dlp exited ${code}: ${Buffer.concat(err).toString().trim()}`));
       } else {
@@ -83,6 +96,7 @@ function saveSeen(seen) {
  * Returns an array of { id, title, url }.
  */
 async function getArtistTracks(artistUrl, limit = config.playlistLimit || 50) {
+  log(`[tracks] Fetching track list: ${artistUrl} (limit ${limit})`);
   const stdout = await runYtDlp([
     '--flat-playlist',
     '-j',
@@ -91,7 +105,7 @@ async function getArtistTracks(artistUrl, limit = config.playlistLimit || 50) {
     artistUrl,
   ]);
 
-  return stdout
+  const tracks = stdout
     .trim()
     .split('\n')
     .filter(line => line.trim())
@@ -108,6 +122,9 @@ async function getArtistTracks(artistUrl, limit = config.playlistLimit || 50) {
       }
     })
     .filter(Boolean);
+
+  log(`[tracks] Got ${tracks.length} tracks from ${artistUrl}`);
+  return tracks;
 }
 
 /**
@@ -115,6 +132,7 @@ async function getArtistTracks(artistUrl, limit = config.playlistLimit || 50) {
  * Returns the full path to the mp3, or null if it can't be found.
  */
 async function downloadTrack(track) {
+  log(`[download] Starting download: "${track.title}" (${track.id})`);
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
   // Use the track ID as the filename to avoid collisions.
@@ -130,7 +148,9 @@ async function downloadTrack(track) {
   ]);
 
   const mp3Path = path.join(DOWNLOADS_DIR, `${track.id}.mp3`);
-  return fs.existsSync(mp3Path) ? mp3Path : null;
+  const exists = fs.existsSync(mp3Path);
+  log(`[download] Finished: "${track.title}" — ${exists ? `saved to ${mp3Path}` : 'NO MP3 PRODUCED'}`);
+  return exists ? mp3Path : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +158,7 @@ async function downloadTrack(track) {
 // ---------------------------------------------------------------------------
 
 async function postTrack(client, track, filePath, artistLabel) {
+  log(`[post] Sending "${track.title}" by ${artistLabel} to Discord…`);
   const channel     = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
   const fileSizeBytes = fs.statSync(filePath).size;
   const maxBytes    = (config.maxFileSizeMB || 8) * 1024 * 1024;
@@ -153,9 +174,11 @@ async function postTrack(client, track, filePath, artistLabel) {
   if (fileSizeBytes <= maxBytes) {
     const attachment = new AttachmentBuilder(filePath, { name: `${safeTitle}.mp3` });
     await channel.send({ content: message, files: [attachment] });
+    log(`[post] Sent "${track.title}" (${(fileSizeBytes / 1024 / 1024).toFixed(1)} MB)`);
   } else {
     const sizeMB = (fileSizeBytes / (1024 * 1024)).toFixed(1);
     await channel.send(`${message}\n*(File is ${sizeMB} MB — too large to attach)*`);
+    log(`[post] Sent "${track.title}" (too large: ${sizeMB} MB, link only)`);
   }
 
   fs.unlinkSync(filePath);
@@ -166,6 +189,7 @@ async function postTrack(client, track, filePath, artistLabel) {
 // ---------------------------------------------------------------------------
 
 async function checkArtist(discordClient, artistUrl) {
+  log(`[check] Checking artist: ${artistUrl}`);
   const seen       = loadSeen();
   const isFirstRun = !(artistUrl in seen);
 
@@ -173,39 +197,44 @@ async function checkArtist(discordClient, artistUrl) {
   try {
     tracks = await getArtistTracks(artistUrl);
   } catch (err) {
-    console.error(`[${artistUrl}] Failed to fetch track list: ${err.message}`);
+    log(`[check] FAILED to fetch track list for ${artistUrl}: ${err.message}`);
     return;
   }
 
   if (isFirstRun) {
     seen[artistUrl] = tracks.map(t => t.id);
     saveSeen(seen);
-    console.log(`[${artistUrl}] First run – marked ${tracks.length} existing tracks as seen.`);
+    log(`[check] First run for ${artistUrl} – marked ${tracks.length} existing tracks as seen.`);
     return;
   }
 
   const seenSet  = new Set(seen[artistUrl]);
   const newTracks = tracks.filter(t => !seenSet.has(t.id));
 
-  if (newTracks.length === 0) return;
+  if (newTracks.length === 0) {
+    log(`[check] No new tracks for ${artistUrl}`);
+    return;
+  }
 
   const artistLabel = artistUrl
     .replace(/^https?:\/\/soundcloud\.com\//, '')
     .replace(/\/tracks\/?$/, '')
     .split('/')[0];
 
+  log(`[check] Found ${newTracks.length} new track(s) for ${artistLabel}`);
+
   for (const track of newTracks) {
-    console.log(`[${artistLabel}] New track detected: ${track.title}`);
+    log(`[check] Processing new track: "${track.title}" (${track.id})`);
     try {
       const filePath = await downloadTrack(track);
       if (filePath) {
         await postTrack(discordClient, track, filePath, artistLabel);
-        console.log(`[${artistLabel}] Posted: ${track.title}`);
+        log(`[check] Successfully posted: "${track.title}"`);
       } else {
-        console.warn(`[${artistLabel}] Download produced no mp3 for: ${track.title}`);
+        log(`[check] WARNING: Download produced no mp3 for: "${track.title}"`);
       }
     } catch (err) {
-      console.error(`[${artistLabel}] Error processing "${track.title}": ${err.message}`);
+      log(`[check] ERROR processing "${track.title}": ${err.message}`);
       // Clean up any partial download.
       const partial = path.join(DOWNLOADS_DIR, `${track.id}.mp3`);
       if (fs.existsSync(partial)) fs.unlinkSync(partial);
@@ -216,6 +245,7 @@ async function checkArtist(discordClient, artistUrl) {
     seen[artistUrl] = Array.from(seenSet);
     saveSeen(seen);
   }
+  log(`[check] Done with ${artistLabel}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -223,10 +253,11 @@ async function checkArtist(discordClient, artistUrl) {
 // ---------------------------------------------------------------------------
 
 async function poll(discordClient) {
-  console.log(`[${new Date().toISOString()}] Polling ${config.artists.length} artist(s)…`);
+  log(`[poll] Starting poll for ${config.artists.length} artist(s)…`);
   for (const name of config.artists) {
     await checkArtist(discordClient, scUrl(name));
   }
+  log(`[poll] Poll complete.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -243,11 +274,12 @@ const discographyCommand = new SlashCommandBuilder()
   );
 
 async function registerCommands(clientId) {
+  log('[commands] Registering slash commands…');
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   await rest.put(Routes.applicationCommands(clientId), {
     body: [discographyCommand.toJSON()],
   });
-  console.log('[commands] Slash commands registered.');
+  log('[commands] Slash commands registered.');
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -256,6 +288,7 @@ client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== 'discography') return;
 
   const artistName = interaction.options.getString('artist').trim().toLowerCase();
+  log(`[discography] Command received for artist: ${artistName}`);
   // Validate: only allow safe SoundCloud usernames (alphanumeric, hyphens, underscores)
   if (!/^[a-z0-9_-]+$/.test(artistName)) {
     await interaction.reply({ content: 'Invalid artist name. Use only letters, numbers, hyphens, or underscores.', ephemeral: true });
@@ -269,45 +302,75 @@ client.on('interactionCreate', async interaction => {
   try {
     tracks = await getArtistTracks(artistUrl, 9999);
   } catch (err) {
+    log(`[discography] FAILED to fetch tracks for ${artistName}: ${err.message}`);
     await interaction.editReply(`Failed to fetch track list: ${err.message}`);
     return;
   }
 
   if (tracks.length === 0) {
+    log(`[discography] No tracks found for ${artistName}`);
     await interaction.editReply(`No tracks found for **${artistName}**.`);
     return;
   }
 
+  log(`[discography] Found ${tracks.length} tracks for ${artistName}, starting downloads…`);
   await interaction.editReply(`Found **${tracks.length}** tracks for **${artistName}**. Downloading and posting…`);
 
   let posted = 0;
   for (const track of tracks) {
     try {
+      log(`[discography] Downloading "${track.title}" (${track.id})…`);
       const filePath = await downloadTrack(track);
       if (filePath) {
         await postTrack(client, track, filePath, artistName);
         posted++;
+        log(`[discography] Posted "${track.title}" (${posted}/${tracks.length})`);
       }
     } catch (err) {
-      console.error(`[discography/${artistName}] Error on "${track.title}": ${err.message}`);
+      log(`[discography] ERROR on "${track.title}": ${err.message}`);
       const partial = path.join(DOWNLOADS_DIR, `${track.id}.mp3`);
       if (fs.existsSync(partial)) fs.unlinkSync(partial);
     }
   }
 
+  log(`[discography] Done for ${artistName}: ${posted}/${tracks.length} posted`);
   await interaction.editReply(`Done! Posted **${posted}/${tracks.length}** tracks for **${artistName}**.`);
 });
 
 client.once('clientReady', async () => {
-  console.log(`Logged in as ${client.user.tag}`);
+  log(`Logged in as ${client.user.tag}`);
   await registerCommands(client.user.id);
 
   // Run immediately, then on a fixed interval.
-  await poll(client);
-  setInterval(() => poll(client), (config.pollIntervalMinutes || 15) * 60 * 1000);
+  try {
+    await poll(client);
+  } catch (err) {
+    log(`[poll] ERROR in initial poll: ${err.message}`);
+  }
+  setInterval(async () => {
+    try {
+      await poll(client);
+    } catch (err) {
+      log(`[poll] ERROR in scheduled poll: ${err.message}`);
+    }
+  }, (config.pollIntervalMinutes || 15) * 60 * 1000);
+});
+
+// ---------------------------------------------------------------------------
+// Process-level safety nets
+// ---------------------------------------------------------------------------
+process.on('unhandledRejection', (reason) => {
+  log(`[FATAL] Unhandled promise rejection: ${reason instanceof Error ? reason.stack : reason}`);
+});
+process.on('uncaughtException', (err) => {
+  log(`[FATAL] Uncaught exception: ${err.stack}`);
+  process.exit(1);
 });
 
 (async () => {
+  log('Starting up…');
   YT_DLP = await ensureYtDlp();
+  log(`Using yt-dlp at: ${YT_DLP}`);
+  log('Logging in to Discord…');
   client.login(process.env.DISCORD_TOKEN);
 })();
