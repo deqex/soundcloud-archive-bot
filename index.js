@@ -44,6 +44,14 @@ const YTDLP_TIMEOUT_MS = 180_000; // 3 minutes per yt-dlp invocation
 
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 
+/** Update the bot's Discord presence/activity status. */
+function setStatus(text, type = 'Custom') {
+  try {
+    const typeMap = { Watching: 3, Listening: 2, Playing: 0, Custom: 4 };
+    client.user?.setActivity({ name: text, type: typeMap[type] ?? 4 });
+  } catch { /* ignore if not ready */ }
+}
+
 /** Run yt-dlp with the given argument array (no shell, avoids injection). Kills after timeout. */
 function runYtDlp(args, timeoutMs = YTDLP_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
@@ -132,6 +140,7 @@ async function getArtistTracks(artistUrl, limit = config.playlistLimit || 50) {
  * Returns the full path to the mp3, or null if it can't be found.
  */
 async function downloadTrack(track) {
+  setStatus(`Downloading: ${track.title}`, 'Listening');
   log(`[download] Starting download: "${track.title}" (${track.id})`);
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
@@ -158,6 +167,7 @@ async function downloadTrack(track) {
 // ---------------------------------------------------------------------------
 
 async function postTrack(client, track, filePath, artistLabel) {
+  setStatus(`Posting: ${track.title}`, 'Playing');
   log(`[post] Sending "${track.title}" by ${artistLabel} to Discord…`);
   const channel     = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
   const fileSizeBytes = fs.statSync(filePath).size;
@@ -189,6 +199,11 @@ async function postTrack(client, track, filePath, artistLabel) {
 // ---------------------------------------------------------------------------
 
 async function checkArtist(discordClient, artistUrl) {
+  const artistLabel = artistUrl
+    .replace(/^https?:\/\/soundcloud\.com\//, '')
+    .replace(/\/tracks\/?$/, '')
+    .split('/')[0];
+  setStatus(`Checking ${artistLabel}…`, 'Watching');
   log(`[check] Checking artist: ${artistUrl}`);
   const seen       = loadSeen();
   const isFirstRun = !(artistUrl in seen);
@@ -215,11 +230,6 @@ async function checkArtist(discordClient, artistUrl) {
     log(`[check] No new tracks for ${artistUrl}`);
     return;
   }
-
-  const artistLabel = artistUrl
-    .replace(/^https?:\/\/soundcloud\.com\//, '')
-    .replace(/\/tracks\/?$/, '')
-    .split('/')[0];
 
   log(`[check] Found ${newTracks.length} new track(s) for ${artistLabel}`);
 
@@ -253,11 +263,13 @@ async function checkArtist(discordClient, artistUrl) {
 // ---------------------------------------------------------------------------
 
 async function poll(discordClient) {
+  setStatus(`Polling ${config.artists.length} artist(s)…`, 'Watching');
   log(`[poll] Starting poll for ${config.artists.length} artist(s)…`);
   for (const name of config.artists) {
     await checkArtist(discordClient, scUrl(name));
   }
   log(`[poll] Poll complete.`);
+  setStatus(`Idle — watching ${config.artists.length} artists`, 'Watching');
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +308,7 @@ client.on('interactionCreate', async interaction => {
   }
 
   const artistUrl = scUrl(artistName);
+  setStatus(`Discography: ${artistName}`, 'Listening');
   await interaction.reply(`Fetching discography for **${artistName}**… this may take a while.`);
 
   let tracks;
@@ -334,11 +347,13 @@ client.on('interactionCreate', async interaction => {
   }
 
   log(`[discography] Done for ${artistName}: ${posted}/${tracks.length} posted`);
+  setStatus(`Idle — watching ${config.artists.length} artists`, 'Watching');
   await interaction.editReply(`Done! Posted **${posted}/${tracks.length}** tracks for **${artistName}**.`);
 });
 
 client.once('clientReady', async () => {
   log(`Logged in as ${client.user.tag}`);
+  setStatus(`Starting up…`, 'Watching');
   await registerCommands(client.user.id);
 
   // Run immediately, then on a fixed interval.
