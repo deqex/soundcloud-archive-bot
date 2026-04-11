@@ -45,7 +45,7 @@ const YTDLP_TIMEOUT_MS = 180_000; // 3 minutes per yt-dlp invocation
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 
 /** Run yt-dlp with the given argument array (no shell, avoids injection). Kills after timeout. */
-function runYtDlp(args) {
+function runYtDlp(args, timeoutMs = YTDLP_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const out  = [];
     const err  = [];
@@ -55,8 +55,8 @@ function runYtDlp(args) {
     const timer = setTimeout(() => {
       killed = true;
       proc.kill('SIGKILL');
-      reject(new Error(`yt-dlp timed out after ${YTDLP_TIMEOUT_MS / 1000}s — args: ${args.join(' ')}`));
-    }, YTDLP_TIMEOUT_MS);
+      reject(new Error(`yt-dlp timed out after ${timeoutMs / 1000}s — args: ${args.join(' ')}`));
+    }, timeoutMs);
 
     proc.stdout.on('data', chunk => out.push(chunk));
     proc.stderr.on('data', chunk => err.push(chunk));
@@ -145,7 +145,7 @@ async function downloadTrack(track) {
     '--no-warnings',
     '-o', outputTemplate,
     track.url,
-  ]);
+  ], 600_000); // 10 min timeout for download + conversion
 
   const mp3Path = path.join(DOWNLOADS_DIR, `${track.id}.mp3`);
   const exists = fs.existsSync(mp3Path);
