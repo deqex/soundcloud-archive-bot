@@ -1,0 +1,9 @@
+{
+  "artists": [
+    "some-artist",
+    "another-artist"
+  ],
+  "pollIntervalMinutes": 15,
+  "playlistLimit": 50,
+  "maxFileSizeMB": 8
+}

@@ -1,0 +1,313 @@
+'use strict';
+
+require('dotenv').config();
+
+const { Client, GatewayIntentBits, AttachmentBuilder, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const { ensureYtDlp } = require('./ytdlp');
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+if (!process.env.DISCORD_TOKEN) {
+  console.error('DISCORD_TOKEN is not set. Copy .env.example to .env and fill in your values.');
+  process.exit(1);
+}
+if (!process.env.DISCORD_CHANNEL_ID) {
+  console.error('DISCORD_CHANNEL_ID is not set. Copy .env.example to .env and fill in your values.');
+  process.exit(1);
+}
+
+const CONFIG_FILE = path.join(__dirname, 'config.json');
+let config;
+try {
+  config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+} catch {
+  console.error('config.json not found. Copy config.example.json to config.json and fill in your values.');
+  process.exit(1);
+}
+
+const SEEN_FILE    = path.join(__dirname, 'data', 'seen.json');
+const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
+let YT_DLP         = path.join(__dirname, 'yt-dlp.exe'); // resolved at startup by ensureYtDlp()
+
+/** Convert a plain SoundCloud username to its tracks URL. */
+const scUrl = name => `https://soundcloud.com/${name}/tracks`;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Run yt-dlp with the given argument array (no shell, avoids injection). */
+function runYtDlp(args) {
+  return new Promise((resolve, reject) => {
+    const out  = [];
+    const err  = [];
+    const proc = spawn(YT_DLP, args);
+
+    proc.stdout.on('data', chunk => out.push(chunk));
+    proc.stderr.on('data', chunk => err.push(chunk));
+
+    proc.on('error', e => reject(new Error(`Failed to start yt-dlp ("${YT_DLP}"): ${e.message}`)));
+    proc.on('close', code => {
+      if (code !== 0) {
+        reject(new Error(`yt-dlp exited ${code}: ${Buffer.concat(err).toString().trim()}`));
+      } else {
+        resolve(Buffer.concat(out).toString());
+      }
+    });
+  });
+}
+
+function loadSeen() {
+  try {
+    return JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveSeen(seen) {
+  fs.mkdirSync(path.dirname(SEEN_FILE), { recursive: true });
+  fs.writeFileSync(SEEN_FILE, JSON.stringify(seen, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// SoundCloud polling
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the track list for an artist URL using yt-dlp's flat-playlist mode.
+ * Returns an array of { id, title, url }.
+ */
+async function getArtistTracks(artistUrl, limit = config.playlistLimit || 50) {
+  const stdout = await runYtDlp([
+    '--flat-playlist',
+    '-j',
+    '--no-warnings',
+    '--playlist-end', String(limit),
+    artistUrl,
+  ]);
+
+  return stdout
+    .trim()
+    .split('\n')
+    .filter(line => line.trim())
+    .map(line => {
+      try {
+        const entry = JSON.parse(line);
+        return {
+          id:    entry.id,
+          title: entry.title || entry.id,
+          url:   entry.webpage_url || entry.url,
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Download a single track as MP3 into DOWNLOADS_DIR.
+ * Returns the full path to the mp3, or null if it can't be found.
+ */
+async function downloadTrack(track) {
+  fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+
+  // Use the track ID as the filename to avoid collisions.
+  const outputTemplate = path.join(DOWNLOADS_DIR, `${track.id}.%(ext)s`);
+
+  await runYtDlp([
+    '-x',
+    '--audio-format', 'mp3',
+    '--audio-quality', '0',
+    '--no-warnings',
+    '-o', outputTemplate,
+    track.url,
+  ]);
+
+  const mp3Path = path.join(DOWNLOADS_DIR, `${track.id}.mp3`);
+  return fs.existsSync(mp3Path) ? mp3Path : null;
+}
+
+// ---------------------------------------------------------------------------
+// Discord posting
+// ---------------------------------------------------------------------------
+
+async function postTrack(client, track, filePath, artistLabel) {
+  const channel     = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
+  const fileSizeBytes = fs.statSync(filePath).size;
+  const maxBytes    = (config.maxFileSizeMB || 8) * 1024 * 1024;
+
+  // Sanitise title for use as a filename.
+  const safeTitle = track.title
+    .replace(/[<>:"/\\|?*]/g, '')
+    .slice(0, 100)
+    .trim() || track.id;
+
+  const message = `New upload from **${artistLabel}**\n**${track.title}**\n<${track.url}>`;
+
+  if (fileSizeBytes <= maxBytes) {
+    const attachment = new AttachmentBuilder(filePath, { name: `${safeTitle}.mp3` });
+    await channel.send({ content: message, files: [attachment] });
+  } else {
+    const sizeMB = (fileSizeBytes / (1024 * 1024)).toFixed(1);
+    await channel.send(`${message}\n*(File is ${sizeMB} MB — too large to attach)*`);
+  }
+
+  fs.unlinkSync(filePath);
+}
+
+// ---------------------------------------------------------------------------
+// Per-artist check
+// ---------------------------------------------------------------------------
+
+async function checkArtist(discordClient, artistUrl) {
+  const seen       = loadSeen();
+  const isFirstRun = !(artistUrl in seen);
+
+  let tracks;
+  try {
+    tracks = await getArtistTracks(artistUrl);
+  } catch (err) {
+    console.error(`[${artistUrl}] Failed to fetch track list: ${err.message}`);
+    return;
+  }
+
+  if (isFirstRun) {
+    seen[artistUrl] = tracks.map(t => t.id);
+    saveSeen(seen);
+    console.log(`[${artistUrl}] First run – marked ${tracks.length} existing tracks as seen.`);
+    return;
+  }
+
+  const seenSet  = new Set(seen[artistUrl]);
+  const newTracks = tracks.filter(t => !seenSet.has(t.id));
+
+  if (newTracks.length === 0) return;
+
+  const artistLabel = artistUrl
+    .replace(/^https?:\/\/soundcloud\.com\//, '')
+    .replace(/\/tracks\/?$/, '')
+    .split('/')[0];
+
+  for (const track of newTracks) {
+    console.log(`[${artistLabel}] New track detected: ${track.title}`);
+    try {
+      const filePath = await downloadTrack(track);
+      if (filePath) {
+        await postTrack(discordClient, track, filePath, artistLabel);
+        console.log(`[${artistLabel}] Posted: ${track.title}`);
+      } else {
+        console.warn(`[${artistLabel}] Download produced no mp3 for: ${track.title}`);
+      }
+    } catch (err) {
+      console.error(`[${artistLabel}] Error processing "${track.title}": ${err.message}`);
+      // Clean up any partial download.
+      const partial = path.join(DOWNLOADS_DIR, `${track.id}.mp3`);
+      if (fs.existsSync(partial)) fs.unlinkSync(partial);
+    }
+
+    // Mark seen even on failure so we don't retry the same track forever.
+    seenSet.add(track.id);
+    seen[artistUrl] = Array.from(seenSet);
+    saveSeen(seen);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function poll(discordClient) {
+  console.log(`[${new Date().toISOString()}] Polling ${config.artists.length} artist(s)…`);
+  for (const name of config.artists) {
+    await checkArtist(discordClient, scUrl(name));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Slash command: /discography
+// ---------------------------------------------------------------------------
+
+const discographyCommand = new SlashCommandBuilder()
+  .setName('discography')
+  .setDescription('Download and post the full discography of a SoundCloud artist')
+  .addStringOption(opt =>
+    opt.setName('artist')
+      .setDescription('SoundCloud username (e.g. archivepex)')
+      .setRequired(true)
+  );
+
+async function registerCommands(clientId) {
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  await rest.put(Routes.applicationCommands(clientId), {
+    body: [discographyCommand.toJSON()],
+  });
+  console.log('[commands] Slash commands registered.');
+}
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'discography') return;
+
+  const artistName = interaction.options.getString('artist').trim().toLowerCase();
+  // Validate: only allow safe SoundCloud usernames (alphanumeric, hyphens, underscores)
+  if (!/^[a-z0-9_-]+$/.test(artistName)) {
+    await interaction.reply({ content: 'Invalid artist name. Use only letters, numbers, hyphens, or underscores.', ephemeral: true });
+    return;
+  }
+
+  const artistUrl = scUrl(artistName);
+  await interaction.reply(`Fetching discography for **${artistName}**… this may take a while.`);
+
+  let tracks;
+  try {
+    tracks = await getArtistTracks(artistUrl, 9999);
+  } catch (err) {
+    await interaction.editReply(`Failed to fetch track list: ${err.message}`);
+    return;
+  }
+
+  if (tracks.length === 0) {
+    await interaction.editReply(`No tracks found for **${artistName}**.`);
+    return;
+  }
+
+  await interaction.editReply(`Found **${tracks.length}** tracks for **${artistName}**. Downloading and posting…`);
+
+  let posted = 0;
+  for (const track of tracks) {
+    try {
+      const filePath = await downloadTrack(track);
+      if (filePath) {
+        await postTrack(client, track, filePath, artistName);
+        posted++;
+      }
+    } catch (err) {
+      console.error(`[discography/${artistName}] Error on "${track.title}": ${err.message}`);
+      const partial = path.join(DOWNLOADS_DIR, `${track.id}.mp3`);
+      if (fs.existsSync(partial)) fs.unlinkSync(partial);
+    }
+  }
+
+  await interaction.editReply(`Done! Posted **${posted}/${tracks.length}** tracks for **${artistName}**.`);
+});
+
+client.once('clientReady', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  await registerCommands(client.user.id);
+
+  // Run immediately, then on a fixed interval.
+  await poll(client);
+  setInterval(() => poll(client), (config.pollIntervalMinutes || 15) * 60 * 1000);
+});
+
+(async () => {
+  YT_DLP = await ensureYtDlp();
+  client.login(process.env.DISCORD_TOKEN);
+})();

@@ -1,0 +1,13 @@
+{
+  "name": "soundcloud-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord bot that posts new SoundCloud uploads as MP3s",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.6.1"
+  }
+}
