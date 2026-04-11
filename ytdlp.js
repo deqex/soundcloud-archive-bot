@@ -84,7 +84,15 @@ async function ensureYtDlp() {
       process.stdout.write(`\n[yt-dlp] GitHub unreachable (${err.message}), using existing copy.\n`);
       return EXE_PATH;
     }
-    throw new Error(`Cannot fetch yt-dlp release info and no local copy exists: ${err.message}`);
+    // No local copy — try system-installed yt-dlp as fallback
+    try {
+      const systemPath = execSync('which yt-dlp', { encoding: 'utf8' }).trim();
+      if (systemPath) {
+        console.log(`\n[yt-dlp] GitHub unreachable (${err.message}), using system yt-dlp at ${systemPath}`);
+        return systemPath;
+      }
+    } catch {}
+    throw new Error(`Cannot fetch yt-dlp release info and no local or system copy exists: ${err.message}\nInstall it with: sudo apt install yt-dlp  OR  pip install yt-dlp`);
   }
 
   const localVersion = fs.existsSync(EXE_PATH) ? await getLocalVersion(EXE_PATH) : null;
