@@ -31,7 +31,7 @@ try {
 
 const SEEN_FILE    = path.join(__dirname, 'data', 'seen.json');
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
-let YT_DLP         = path.join(__dirname, 'yt-dlp.exe'); // resolved at startup by ensureYtDlp()
+let YT_DLP         = path.join(__dirname, 'yt-dlp'); // resolved at startup by ensureYtDlp()
 
 /** Convert a plain SoundCloud username to its tracks URL. */
 const scUrl = name => `https://soundcloud.com/${name}/tracks`;

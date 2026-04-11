@@ -3,9 +3,9 @@
 const https = require('https');
 const fs    = require('fs');
 const path  = require('path');
-const { execFile } = require('child_process');
+const { execFile, execSync } = require('child_process');
 
-const EXE_PATH   = path.join(__dirname, 'yt-dlp.exe');
+const EXE_PATH   = path.join(__dirname, 'yt-dlp');
 const GITHUB_API = 'https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest';
 
 // ---------------------------------------------------------------------------
@@ -76,8 +76,8 @@ async function ensureYtDlp() {
     if (statusCode !== 200) throw new Error(`GitHub API returned HTTP ${statusCode}`);
     const release = JSON.parse(body.toString());
     latestTag   = release.tag_name;
-    const asset = release.assets.find(a => a.name === 'yt-dlp.exe');
-    if (!asset) throw new Error('yt-dlp.exe not found in latest release assets');
+    const asset = release.assets.find(a => a.name === 'yt-dlp_linux');
+    if (!asset) throw new Error('yt-dlp_linux not found in latest release assets');
     downloadUrl = asset.browser_download_url;
   } catch (err) {
     if (fs.existsSync(EXE_PATH)) {
@@ -101,6 +101,7 @@ async function ensureYtDlp() {
   }
 
   await downloadFile(downloadUrl, EXE_PATH);
+  fs.chmodSync(EXE_PATH, 0o755);
   console.log(`[yt-dlp] Ready (${latestTag})`);
   return EXE_PATH;
 }
