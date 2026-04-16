@@ -285,11 +285,20 @@ const discographyCommand = new SlashCommandBuilder()
       .setRequired(true)
   );
 
+const addCommand = new SlashCommandBuilder()
+  .setName('add')
+  .setDescription('Add a SoundCloud artist to the watch list')
+  .addStringOption(opt =>
+    opt.setName('artist')
+      .setDescription('SoundCloud username (e.g. archivepex)')
+      .setRequired(true)
+  );
+
 async function registerCommands(clientId) {
   log('[commands] Registering slash commands…');
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   await rest.put(Routes.applicationCommands(clientId), {
-    body: [discographyCommand.toJSON()],
+    body: [discographyCommand.toJSON(), addCommand.toJSON()],
   });
   log('[commands] Slash commands registered.');
 }
@@ -297,7 +306,26 @@ async function registerCommands(clientId) {
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== 'discography') return;
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.commandName === 'add') {
+    const artistName = interaction.options.getString('artist').trim().toLowerCase();
+    if (!/^[a-z0-9_-]+$/.test(artistName)) {
+      await interaction.reply({ content: 'Invalid artist name. Use only letters, numbers, hyphens, or underscores.', ephemeral: true });
+      return;
+    }
+    if (config.artists.includes(artistName)) {
+      await interaction.reply({ content: `**${artistName}** is already on the watch list.`, ephemeral: true });
+      return;
+    }
+    config.artists.push(artistName);
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+    log(`[add] Added artist: ${artistName}`);
+    await interaction.reply(`Added **${artistName}** to the watch list (${config.artists.length} artists total).`);
+    return;
+  }
+
+  if (interaction.commandName !== 'discography') return;
 
   const artistName = interaction.options.getString('artist').trim().toLowerCase();
   log(`[discography] Command received for artist: ${artistName}`);
