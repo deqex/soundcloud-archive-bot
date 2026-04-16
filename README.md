@@ -1,6 +1,7 @@
 # soundcloud-archives
 
 Discord bot that monitors SoundCloud artists and automatically posts new uploads as MP3s to a Discord channel.
+Made for linux, tweaks to the yt-dlp download might be needed to work for windows.
 
 ## Features
 
